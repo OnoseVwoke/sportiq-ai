@@ -1,0 +1,39 @@
+name: Build and Push Docker Images
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/sportiq-backend:latest
+
+      - name: Build and push data-pipeline
+        uses: docker/build-push-action@v6
+        with:
+          context: ./data-pipeline
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/sportiq-pipeline:latest
+
+      - name: Build and push frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/sportiq-frontend:latest

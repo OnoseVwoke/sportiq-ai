@@ -30,14 +30,17 @@ def get_fixtures(league: str | None = None, status: str | None = None):
     """
     Returns fixtures, optionally filtered by league or status
     (scheduled | live | finished). This is what the homepage's
-    match list and live-scores bar both read from.
+    match list and live-scores bar both read from. Includes
+    averaged match-winner odds where available.
     """
     query = """
         SELECT f.id, f.league, ht.name AS home_team, at.name AS away_team,
-               f.kickoff_time, f.status, f.home_score, f.away_score
+               f.kickoff_time, f.status, f.home_score, f.away_score,
+               o.home_odds, o.draw_odds, o.away_odds, o.bookmaker_count
         FROM fixtures f
         JOIN teams ht ON ht.id = f.home_team_id
         JOIN teams at ON at.id = f.away_team_id
+        LEFT JOIN odds o ON o.fixture_id = f.id
         WHERE (:league IS NULL OR f.league = :league)
           AND (:status IS NULL OR f.status = :status)
         ORDER BY f.kickoff_time ASC

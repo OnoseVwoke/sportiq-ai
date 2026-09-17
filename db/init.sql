@@ -27,6 +27,16 @@ CREATE TABLE IF NOT EXISTS predictions (
     created_at TIMESTAMP DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS odds (
+    id SERIAL PRIMARY KEY,
+    fixture_id INTEGER REFERENCES fixtures(id) UNIQUE,
+    home_odds NUMERIC(6,2),
+    draw_odds NUMERIC(6,2),
+    away_odds NUMERIC(6,2),
+    bookmaker_count INTEGER,       -- how many bookmakers these are averaged across
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     email TEXT UNIQUE NOT NULL,

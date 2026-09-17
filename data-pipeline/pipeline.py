@@ -60,6 +60,113 @@ def fetch_fixtures():
     return fixtures
 
 
+ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/soccer_epl/odds"
+
+
+def normalize_team_name(name):
+    """Strips common club suffixes so names from different data
+    providers ('Arsenal FC' vs 'Arsenal') can be matched."""
+    name = name.lower().strip()
+    for suffix in (" fc", " afc", " cf"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+    return name.strip()
+
+
+def fetch_odds():
+    """
+    Pulls Premier League match-winner (h2h) odds from TheOddsAPI.
+    Free tier: 500 requests/month.
+    """
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": "uk",
+        "markets": "h2h",
+        "oddsFormat": "decimal",
+    }
+    response = requests.get(ODDS_API_URL, params=params, timeout=15)
+    response.raise_for_status()
+    return response.json()
+
+
+def average_h2h_odds(event):
+    """Averages each outcome's price across every bookmaker offering it."""
+    home_name = event["home_team"]
+    away_name = event["away_team"]
+    home_prices, draw_prices, away_prices = [], [], []
+
+    for bookmaker in event.get("bookmakers", []):
+        for market in bookmaker.get("markets", []):
+            if market["key"] != "h2h":
+                continue
+            for outcome in market["outcomes"]:
+                if outcome["name"] == home_name:
+                    home_prices.append(outcome["price"])
+                elif outcome["name"] == away_name:
+                    away_prices.append(outcome["price"])
+                elif outcome["name"] == "Draw":
+                    draw_prices.append(outcome["price"])
+
+    if not home_prices or not away_prices:
+        return None
+
+    return {
+        "home": round(sum(home_prices) / len(home_prices), 2),
+        "draw": round(sum(draw_prices) / len(draw_prices), 2) if draw_prices else None,
+        "away": round(sum(away_prices) / len(away_prices), 2),
+        "count": len(home_prices),
+    }
+
+
+def save_odds(events):
+    """Matches each odds-API event to a fixture already in our DB
+    (by normalized team name) and upserts the averaged odds."""
+    saved = 0
+    with engine.begin() as conn:
+        fixtures = conn.execute(text("""
+            SELECT f.id, ht.name AS home, at.name AS away
+            FROM fixtures f
+            JOIN teams ht ON ht.id = f.home_team_id
+            JOIN teams at ON at.id = f.away_team_id
+        """)).fetchall()
+        fixture_lookup = [
+            (row.id, normalize_team_name(row.home), normalize_team_name(row.away))
+            for row in fixtures
+        ]
+
+        for event in events:
+            odds = average_h2h_odds(event)
+            if not odds:
+                continue
+
+            norm_home = normalize_team_name(event["home_team"])
+            norm_away = normalize_team_name(event["away_team"])
+
+            match_id = None
+            for fid, fhome, faway in fixture_lookup:
+                if (norm_home in fhome or fhome in norm_home) and (norm_away in faway or faway in norm_away):
+                    match_id = fid
+                    break
+            if not match_id:
+                continue
+
+            conn.execute(text("""
+                INSERT INTO odds (fixture_id, home_odds, draw_odds, away_odds, bookmaker_count, updated_at)
+                VALUES (:fid, :home, :draw, :away, :count, NOW())
+                ON CONFLICT (fixture_id) DO UPDATE SET
+                    home_odds = EXCLUDED.home_odds,
+                    draw_odds = EXCLUDED.draw_odds,
+                    away_odds = EXCLUDED.away_odds,
+                    bookmaker_count = EXCLUDED.bookmaker_count,
+                    updated_at = NOW()
+            """), {
+                "fid": match_id, "home": odds["home"], "draw": odds["draw"],
+                "away": odds["away"], "count": odds["count"],
+            })
+            saved += 1
+    return saved
+
+
 def get_or_create_team(conn, name, league):
     row = conn.execute(
         text("SELECT id FROM teams WHERE name = :name AND league = :league"),
@@ -148,6 +255,17 @@ def run():
     fixture_ids = save_fixtures(fixtures)
     print(f"Saved {len(fixture_ids)} fixtures. Generating predictions...")
     save_predictions(fixture_ids)
+
+    print("Fetching odds...")
+    try:
+        events = fetch_odds()
+        saved = save_odds(events)
+        print(f"Saved odds for {saved} fixtures")
+    except Exception as exc:
+        # Odds are a nice-to-have on top of fixtures — don't let a
+        # failed odds fetch take down the whole pipeline run.
+        print(f"Odds fetch failed (continuing without odds): {exc}")
+
     print("Done.")
 
 

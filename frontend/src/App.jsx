@@ -57,6 +57,13 @@ function App() {
                 {new Date(fx.kickoff_time).toLocaleString()}
               </p>
               <span style={styles.status}>{fx.status}</span>
+              {fx.home_odds && (
+                <div style={styles.odds}>
+                  <span>Home {fx.home_odds}</span>
+                  {fx.draw_odds && <span>Draw {fx.draw_odds}</span>}
+                  <span>Away {fx.away_odds}</span>
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -79,6 +86,7 @@ const styles = {
   match: { fontSize: 15, margin: "0 0 4px" },
   kickoff: { fontSize: 12, color: "#9aa0a6", margin: 0 },
   status: { fontSize: 11, color: "#8ab4f8" },
+  odds: { display: "flex", gap: 12, marginTop: 8, fontSize: 12, color: "#9aa0a6" },
 };
 
 export default App;

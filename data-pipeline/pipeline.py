@@ -7,13 +7,13 @@ GitHub Actions / AWS EventBridge) to:
   2. Save them into Postgres
   3. Run the prediction model and save its output
 
-Step 1 (fixtures) now pulls real data from football-data.org. Step 3
-(predictions) is still a placeholder random model — see the
-`# TODO` marker below for where the real trained model plugs in.
+Step 1 (fixtures) pulls real data from football-data.org. Step 3
+(predictions) now trains a real logistic regression model on
+historical results each run and uses it to predict upcoming
+fixtures — see train_model() and predict_match() below.
 """
 
 import os
-import random
 from datetime import datetime, timedelta
 
 import requests
@@ -216,45 +216,214 @@ def save_fixtures(fixtures):
     return saved_ids
 
 
-def predict(fixture_id):
+def fetch_historical_results(days_back=270):
     """
-    TODO: replace with a real model — start with a simple
-    scikit-learn / XGBoost classifier trained on historical
-    results + odds (see Phase 1 of the build plan). This
-    placeholder just picks a random confidence so the API and
-    frontend have real rows to display while the model is built.
+    Pulls finished Premier League matches from roughly the last 9
+    months, to use as training data. Same API/endpoint as
+    fetch_fixtures, just filtered to already-played matches.
     """
-    outcome = random.choice(["home_win", "draw", "away_win"])
-    confidence = round(random.uniform(45, 80), 2)
+    headers = {"X-Auth-Token": SPORTS_API_KEY}
+    today = datetime.utcnow().date()
+    params = {
+        "dateFrom": (today - timedelta(days=days_back)).isoformat(),
+        "dateTo": today.isoformat(),
+        "status": "FINISHED",
+    }
+    response = requests.get(API_FOOTBALL_URL, headers=headers, params=params, timeout=15)
+    response.raise_for_status()
+    data = response.json()
+
+    results = []
+    for match in data.get("matches", []):
+        score = match.get("score", {}).get("fullTime", {})
+        if score.get("home") is None or score.get("away") is None:
+            continue
+        results.append({
+            "home": match["homeTeam"]["name"],
+            "away": match["awayTeam"]["name"],
+            "home_goals": score["home"],
+            "away_goals": score["away"],
+        })
+    return results
+
+
+def compute_team_stats(results):
+    """Each team's average goals scored and conceded across the
+    historical results — a simple stand-in for 'team strength'."""
+    raw = {}
+    for r in results:
+        raw.setdefault(r["home"], {"scored": [], "conceded": []})
+        raw.setdefault(r["away"], {"scored": [], "conceded": []})
+        raw[r["home"]]["scored"].append(r["home_goals"])
+        raw[r["home"]]["conceded"].append(r["away_goals"])
+        raw[r["away"]]["scored"].append(r["away_goals"])
+        raw[r["away"]]["conceded"].append(r["home_goals"])
+
+    return {
+        team: {
+            "avg_scored": sum(s["scored"]) / len(s["scored"]),
+            "avg_conceded": sum(s["conceded"]) / len(s["conceded"]),
+        }
+        for team, s in raw.items()
+    }
+
+
+def build_training_data(results, team_stats):
+    """Turns historical results into (features, outcome) pairs for training."""
+    X, y = [], []
+    for r in results:
+        home_stats = team_stats.get(r["home"])
+        away_stats = team_stats.get(r["away"])
+        if not home_stats or not away_stats:
+            continue
+        X.append([
+            home_stats["avg_scored"], home_stats["avg_conceded"],
+            away_stats["avg_scored"], away_stats["avg_conceded"],
+        ])
+        if r["home_goals"] > r["away_goals"]:
+            y.append("home_win")
+        elif r["home_goals"] < r["away_goals"]:
+            y.append("away_win")
+        else:
+            y.append("draw")
+    return X, y
+
+
+def train_model(X, y):
+    """
+    Trains a simple logistic regression classifier on team scoring
+    averages. Retrained fresh on every pipeline run — the dataset
+    is small enough (one season) that this is fast and always
+    reflects the latest results, no model file to manage.
+    """
+    from sklearn.linear_model import LogisticRegression
+
+    if len(X) < 20 or len(set(y)) < 2:
+        # Not enough historical data yet to train meaningfully.
+        return None
+
+    model = LogisticRegression(max_iter=1000)
+    model.fit(X, y)
+    return model
+
+
+def predict_match(model, team_stats, home_team, away_team):
+    """
+    Predicts one fixture's outcome using the trained model and the
+    two teams' current scoring averages. Falls back to a neutral
+    50/33/17-ish guess if we don't have enough data for one of the
+    teams or the model itself (e.g. newly promoted side, or too
+    early in a season).
+    """
+    home_stats = team_stats.get(home_team)
+    away_stats = team_stats.get(away_team)
+
+    if not model or not home_stats or not away_stats:
+        return "home_win", 40.0  # conservative fallback, not a real prediction
+
+    features = [[
+        home_stats["avg_scored"], home_stats["avg_conceded"],
+        away_stats["avg_scored"], away_stats["avg_conceded"],
+    ]]
+    probabilities = model.predict_proba(features)[0]
+    classes = model.classes_
+    best_idx = probabilities.argmax()
+    outcome = str(classes[best_idx])
+    confidence = round(float(probabilities[best_idx]) * 100, 2)
     return outcome, confidence
 
 
-def save_predictions(fixture_ids):
+def predict_extra_markets(team_stats, home_team, away_team):
+    """
+    Estimates BTTS and Over/Under 2.5 goals using a Poisson goal
+    model built from the same team scoring averages as the main
+    result prediction — no extra API calls needed.
+    """
+    from scipy.stats import poisson
+
+    home_stats = team_stats.get(home_team)
+    away_stats = team_stats.get(away_team)
+    if not home_stats or not away_stats:
+        return []
+
+    lambda_home = (home_stats["avg_scored"] + away_stats["avg_conceded"]) / 2
+    lambda_away = (away_stats["avg_scored"] + home_stats["avg_conceded"]) / 2
+    lambda_total = lambda_home + lambda_away
+
+    p_home_scores = 1 - poisson.pmf(0, lambda_home)
+    p_away_scores = 1 - poisson.pmf(0, lambda_away)
+    p_btts = float(p_home_scores * p_away_scores)
+
+    p_over_2_5 = float(1 - poisson.cdf(2, lambda_total))
+
+    predictions = []
+    if p_btts >= 0.5:
+        predictions.append(("btts", "yes", round(p_btts * 100, 2)))
+    else:
+        predictions.append(("btts", "no", round((1 - p_btts) * 100, 2)))
+
+    if p_over_2_5 >= 0.5:
+        predictions.append(("over_2_5", "over", round(p_over_2_5 * 100, 2)))
+    else:
+        predictions.append(("over_2_5", "under", round((1 - p_over_2_5) * 100, 2)))
+
+    return predictions
+
+
+def save_predictions(fixture_ids, model, team_stats):
     with engine.begin() as conn:
         for fid in fixture_ids:
-            existing = conn.execute(
-                text("SELECT id FROM predictions WHERE fixture_id = :fid AND market = 'match_result'"),
+            row = conn.execute(
+                text("""
+                    SELECT ht.name AS home, at.name AS away
+                    FROM fixtures f
+                    JOIN teams ht ON ht.id = f.home_team_id
+                    JOIN teams at ON at.id = f.away_team_id
+                    WHERE f.id = :fid
+                """),
                 {"fid": fid},
             ).fetchone()
-            if existing:
+            if not row:
                 continue
 
-            outcome, confidence = predict(fid)
-            conn.execute(
-                text("""
-                    INSERT INTO predictions (fixture_id, market, prediction, confidence)
-                    VALUES (:fid, 'match_result', :prediction, :confidence)
-                """),
-                {"fid": fid, "prediction": outcome, "confidence": confidence},
-            )
+            outcome, confidence = predict_match(model, team_stats, row.home, row.away)
+            all_predictions = [("match_result", outcome, confidence)]
+            all_predictions += predict_extra_markets(team_stats, row.home, row.away)
+
+            for market, prediction, conf in all_predictions:
+                existing = conn.execute(
+                    text("SELECT id FROM predictions WHERE fixture_id = :fid AND market = :market"),
+                    {"fid": fid, "market": market},
+                ).fetchone()
+                if existing:
+                    continue
+                conn.execute(
+                    text("""
+                        INSERT INTO predictions (fixture_id, market, prediction, confidence)
+                        VALUES (:fid, :market, :prediction, :confidence)
+                    """),
+                    {"fid": fid, "market": market, "prediction": prediction, "confidence": conf},
+                )
 
 
 def run():
     print("SportIQ AI pipeline: fetching fixtures...")
     fixtures = fetch_fixtures()
     fixture_ids = save_fixtures(fixtures)
-    print(f"Saved {len(fixture_ids)} fixtures. Generating predictions...")
-    save_predictions(fixture_ids)
+    print(f"Saved {len(fixture_ids)} fixtures.")
+
+    print("Fetching historical results to train the prediction model...")
+    historical = fetch_historical_results()
+    team_stats = compute_team_stats(historical)
+    X, y = build_training_data(historical, team_stats)
+    model = train_model(X, y)
+    if model:
+        print(f"Trained model on {len(X)} historical matches.")
+    else:
+        print("Not enough historical data to train a model yet — using fallback predictions.")
+
+    print("Generating predictions...")
+    save_predictions(fixture_ids, model, team_stats)
 
     print("Fetching odds...")
     try:

@@ -31,22 +31,54 @@ def get_fixtures(league: str | None = None, status: str | None = None):
     Returns fixtures, optionally filtered by league or status
     (scheduled | live | finished). This is what the homepage's
     match list and live-scores bar both read from. Includes
-    averaged match-winner odds where available.
+    averaged match-winner odds and the model's prediction for
+    each market (result, BTTS, over/under 2.5) where available.
     """
     query = """
         SELECT f.id, f.league, ht.name AS home_team, at.name AS away_team,
                f.kickoff_time, f.status, f.home_score, f.away_score,
-               o.home_odds, o.draw_odds, o.away_odds, o.bookmaker_count
+               o.home_odds, o.draw_odds, o.away_odds, o.bookmaker_count,
+               MAX(CASE WHEN p.market = 'match_result' THEN p.prediction END) AS result_prediction,
+               MAX(CASE WHEN p.market = 'match_result' THEN p.confidence END) AS result_confidence,
+               MAX(CASE WHEN p.market = 'btts' THEN p.prediction END) AS btts_prediction,
+               MAX(CASE WHEN p.market = 'btts' THEN p.confidence END) AS btts_confidence,
+               MAX(CASE WHEN p.market = 'over_2_5' THEN p.prediction END) AS over_2_5_prediction,
+               MAX(CASE WHEN p.market = 'over_2_5' THEN p.confidence END) AS over_2_5_confidence
         FROM fixtures f
         JOIN teams ht ON ht.id = f.home_team_id
         JOIN teams at ON at.id = f.away_team_id
         LEFT JOIN odds o ON o.fixture_id = f.id
+        LEFT JOIN predictions p ON p.fixture_id = f.id
         WHERE (:league IS NULL OR f.league = :league)
           AND (:status IS NULL OR f.status = :status)
+        GROUP BY f.id, f.league, ht.name, at.name, f.kickoff_time, f.status,
+                 f.home_score, f.away_score, o.home_odds, o.draw_odds, o.away_odds, o.bookmaker_count
         ORDER BY f.kickoff_time ASC
     """
     with engine.connect() as conn:
         rows = conn.execute(text(query), {"league": league, "status": status}).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.get("/best-picks")
+def get_best_picks(min_confidence: float = 85.0):
+    """
+    Returns every prediction (across all markets and fixtures) at
+    or above the given confidence threshold — the accumulator of
+    the model's most confident selections.
+    """
+    query = """
+        SELECT f.id AS fixture_id, f.league, ht.name AS home_team, at.name AS away_team,
+               f.kickoff_time, p.market, p.prediction, p.confidence
+        FROM predictions p
+        JOIN fixtures f ON f.id = p.fixture_id
+        JOIN teams ht ON ht.id = f.home_team_id
+        JOIN teams at ON at.id = f.away_team_id
+        WHERE p.confidence >= :min_confidence
+        ORDER BY p.confidence DESC
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(text(query), {"min_confidence": min_confidence}).mappings().all()
     return [dict(r) for r in rows]
 
 

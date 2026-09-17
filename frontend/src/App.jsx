@@ -6,6 +6,7 @@ const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
 
 function App() {
   const [fixtures, setFixtures] = useState([]);
+  const [bestPicks, setBestPicks] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -18,6 +19,11 @@ function App() {
       .then((data) => setFixtures(data))
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
+
+    fetch(`${API_URL}/best-picks`)
+      .then((res) => (res.ok ? res.json() : []))
+      .then((data) => setBestPicks(data))
+      .catch(() => setBestPicks([]));
   }, []);
 
   return (
@@ -33,6 +39,22 @@ function App() {
       </header>
 
       <main style={styles.main}>
+        {bestPicks.length > 0 && (
+          <div style={styles.bestPicksPanel}>
+            <h2 style={styles.bestPicksTitle}>Best picks (85%+ confidence)</h2>
+            <div style={styles.bestPicksList}>
+              {bestPicks.map((pick, i) => (
+                <div key={i} style={styles.bestPickRow}>
+                  <span>{pick.home_team} vs {pick.away_team}</span>
+                  <span style={styles.bestPickCall}>
+                    {formatMarket(pick.market)}: {formatPrediction(pick.prediction)} ({pick.confidence}%)
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         <h2 style={styles.sectionTitle}>Today's fixtures</h2>
 
         {loading && <p>Loading fixtures...</p>}
@@ -57,6 +79,32 @@ function App() {
                 {new Date(fx.kickoff_time).toLocaleString()}
               </p>
               <span style={styles.status}>{fx.status}</span>
+              {fx.result_prediction && (
+                <div style={styles.markets}>
+                  <div style={styles.marketRow}>
+                    <span style={styles.marketLabel}>Result</span>
+                    <span style={styles.marketPick}>
+                      Our pick: {formatPrediction(fx.result_prediction)} ({fx.result_confidence}%)
+                    </span>
+                  </div>
+                  {fx.btts_prediction && (
+                    <div style={styles.marketRow}>
+                      <span style={styles.marketLabel}>BTTS</span>
+                      <span style={styles.marketPick}>
+                        {formatPrediction(fx.btts_prediction)} ({fx.btts_confidence}%)
+                      </span>
+                    </div>
+                  )}
+                  {fx.over_2_5_prediction && (
+                    <div style={styles.marketRow}>
+                      <span style={styles.marketLabel}>O/U 2.5</span>
+                      <span style={styles.marketPick}>
+                        {formatPrediction(fx.over_2_5_prediction)} ({fx.over_2_5_confidence}%)
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
               {fx.home_odds && (
                 <div style={styles.odds}>
                   <span>Home {fx.home_odds}</span>
@@ -70,6 +118,19 @@ function App() {
       </main>
     </div>
   );
+}
+
+function formatPrediction(prediction) {
+  const labels = {
+    home_win: "Home win", draw: "Draw", away_win: "Away win",
+    yes: "Yes", no: "No", over: "Over", under: "Under",
+  };
+  return labels[prediction] || prediction;
+}
+
+function formatMarket(market) {
+  const labels = { match_result: "Result", btts: "BTTS", over_2_5: "O/U 2.5" };
+  return labels[market] || market;
 }
 
 const styles = {
@@ -86,7 +147,16 @@ const styles = {
   match: { fontSize: 15, margin: "0 0 4px" },
   kickoff: { fontSize: 12, color: "#9aa0a6", margin: 0 },
   status: { fontSize: 11, color: "#8ab4f8" },
+  markets: { marginTop: 8, display: "flex", flexDirection: "column", gap: 4 },
+  marketRow: { display: "flex", justifyContent: "space-between", fontSize: 12 },
+  marketLabel: { color: "#9aa0a6" },
+  marketPick: { color: "#81c995", fontWeight: 500 },
   odds: { display: "flex", gap: 12, marginTop: 8, fontSize: 12, color: "#9aa0a6" },
+  bestPicksPanel: { background: "#1b2a1e", border: "1px solid #2d4a33", borderRadius: 10, padding: 16, marginBottom: 24, maxWidth: 480 },
+  bestPicksTitle: { fontSize: 14, color: "#81c995", margin: "0 0 10px" },
+  bestPicksList: { display: "flex", flexDirection: "column", gap: 8 },
+  bestPickRow: { display: "flex", justifyContent: "space-between", fontSize: 12, color: "#e6e6e6" },
+  bestPickCall: { color: "#81c995", fontWeight: 500 },
 };
 
 export default App;

@@ -3,17 +3,18 @@ SportIQ AI — data pipeline
 
 This is the container that runs on a schedule (via a cron job or
 GitHub Actions / AWS EventBridge) to:
-  1. Pull fixtures + odds from external sports APIs
+  1. Pull fixtures + odds from external sports APIs, across all
+     configured leagues (see LEAGUES below)
   2. Save them into Postgres
-  3. Run the prediction model and save its output
+  3. Train a real model on historical results and save predictions
 
-Step 1 (fixtures) pulls real data from football-data.org. Step 3
-(predictions) now trains a real logistic regression model on
-historical results each run and uses it to predict upcoming
-fixtures — see train_model() and predict_match() below.
+Step 3 trains a logistic regression for match result (home/draw/away)
+plus a Poisson goal model for BTTS and Over/Under 2.5 — see
+train_model() and predict_extra_markets().
 """
 
 import os
+import time
 from datetime import datetime, timedelta
 
 import requests
@@ -26,41 +27,84 @@ ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 
-API_FOOTBALL_URL = "https://api.football-data.org/v4/competitions/PL/matches"
+# Leagues covered — all available on football-data.org's free tier,
+# plus their matching TheOddsAPI sport_key for odds.
+LEAGUES = [
+    {"code": "PL", "name": "Premier League", "odds_key": "soccer_epl"},
+    {"code": "ELC", "name": "Championship", "odds_key": "soccer_efl_champ"},
+    {"code": "PD", "name": "La Liga", "odds_key": "soccer_spain_la_liga"},
+    {"code": "BL1", "name": "Bundesliga", "odds_key": "soccer_germany_bundesliga"},
+    {"code": "SA", "name": "Serie A", "odds_key": "soccer_italy_serie_a"},
+    {"code": "FL1", "name": "Ligue 1", "odds_key": "soccer_france_ligue_one"},
+    {"code": "CL", "name": "Champions League", "odds_key": "soccer_uefa_champs_league"},
+]
+
+FOOTBALL_DATA_BASE = "https://api.football-data.org/v4/competitions"
+ODDS_API_BASE = "https://api.the-odds-api.com/v4/sports"
+
+# football-data.org free tier is limited to 10 requests/minute. We
+# make 2 calls per league (fixtures + historical), so pace them out
+# to stay safely under that.
+FOOTBALL_DATA_PACING_SECONDS = 8
 
 
-def fetch_fixtures():
-    """
-    Pulls Premier League fixtures for the next 7 days from
-    football-data.org. Free tier: 10 requests/minute, no
-    restrictive monthly cap, and current-season data is
-    actually included (unlike API-Football's free tier).
-    """
+def fetch_fixtures(league):
+    """Pulls fixtures for the next 7 days for one league."""
     headers = {"X-Auth-Token": SPORTS_API_KEY}
     today = datetime.utcnow().date()
     params = {
         "dateFrom": today.isoformat(),
         "dateTo": (today + timedelta(days=7)).isoformat(),
     }
+    url = f"{FOOTBALL_DATA_BASE}/{league['code']}/matches"
 
-    response = requests.get(API_FOOTBALL_URL, headers=headers, params=params, timeout=15)
+    response = requests.get(url, headers=headers, params=params, timeout=15)
     response.raise_for_status()
     data = response.json()
 
     fixtures = []
     for match in data.get("matches", []):
         fixtures.append({
-            "league": "Premier League",
+            "league": league["name"],
             "home": match["homeTeam"]["name"],
             "away": match["awayTeam"]["name"],
             "kickoff": datetime.fromisoformat(match["utcDate"].replace("Z", "+00:00")),
         })
 
-    print(f"Found {len(fixtures)} fixtures in the next 7 days")
+    print(f"  {league['name']}: found {len(fixtures)} fixtures in the next 7 days")
     return fixtures
 
 
-ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/soccer_epl/odds"
+def fetch_historical_results(league, days_back=270):
+    """Pulls finished matches from roughly the last 9 months, for training."""
+    headers = {"X-Auth-Token": SPORTS_API_KEY}
+    today = datetime.utcnow().date()
+    params = {
+        "dateFrom": (today - timedelta(days=days_back)).isoformat(),
+        "dateTo": today.isoformat(),
+        "status": "FINISHED",
+    }
+    url = f"{FOOTBALL_DATA_BASE}/{league['code']}/matches"
+
+    response = requests.get(url, headers=headers, params=params, timeout=15)
+    response.raise_for_status()
+    data = response.json()
+
+    results = []
+    for match in data.get("matches", []):
+        score = match.get("score", {}).get("fullTime", {})
+        if score.get("home") is None or score.get("away") is None:
+            continue
+        results.append({
+            "league": league["name"],
+            "home": match["homeTeam"]["name"],
+            "away": match["awayTeam"]["name"],
+            "home_goals": score["home"],
+            "away_goals": score["away"],
+        })
+
+    print(f"  {league['name']}: found {len(results)} historical results")
+    return results
 
 
 def normalize_team_name(name):
@@ -73,18 +117,16 @@ def normalize_team_name(name):
     return name.strip()
 
 
-def fetch_odds():
-    """
-    Pulls Premier League match-winner (h2h) odds from TheOddsAPI.
-    Free tier: 500 requests/month.
-    """
+def fetch_odds(league):
+    """Pulls match-winner (h2h) odds for one league from TheOddsAPI."""
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": "uk",
         "markets": "h2h",
         "oddsFormat": "decimal",
     }
-    response = requests.get(ODDS_API_URL, params=params, timeout=15)
+    url = f"{ODDS_API_BASE}/{league['odds_key']}/odds"
+    response = requests.get(url, params=params, timeout=15)
     response.raise_for_status()
     return response.json()
 
@@ -118,9 +160,9 @@ def average_h2h_odds(event):
     }
 
 
-def save_odds(events):
-    """Matches each odds-API event to a fixture already in our DB
-    (by normalized team name) and upserts the averaged odds."""
+def save_odds(events, league_name):
+    """Matches each odds-API event to a fixture in this league already
+    in our DB (by normalized team name) and upserts the averaged odds."""
     saved = 0
     with engine.begin() as conn:
         fixtures = conn.execute(text("""
@@ -128,7 +170,8 @@ def save_odds(events):
             FROM fixtures f
             JOIN teams ht ON ht.id = f.home_team_id
             JOIN teams at ON at.id = f.away_team_id
-        """)).fetchall()
+            WHERE f.league = :league
+        """), {"league": league_name}).fetchall()
         fixture_lookup = [
             (row.id, normalize_team_name(row.home), normalize_team_name(row.away))
             for row in fixtures
@@ -188,9 +231,6 @@ def save_fixtures(fixtures):
             home_id = get_or_create_team(conn, fx["home"], fx["league"])
             away_id = get_or_create_team(conn, fx["away"], fx["league"])
 
-            # Skip if this exact fixture (same teams + kickoff time) is
-            # already saved, so re-running the pipeline doesn't pile up
-            # duplicates.
             existing = conn.execute(
                 text("""
                     SELECT id FROM fixtures
@@ -216,64 +256,36 @@ def save_fixtures(fixtures):
     return saved_ids
 
 
-def fetch_historical_results(days_back=270):
-    """
-    Pulls finished Premier League matches from roughly the last 9
-    months, to use as training data. Same API/endpoint as
-    fetch_fixtures, just filtered to already-played matches.
-    """
-    headers = {"X-Auth-Token": SPORTS_API_KEY}
-    today = datetime.utcnow().date()
-    params = {
-        "dateFrom": (today - timedelta(days=days_back)).isoformat(),
-        "dateTo": today.isoformat(),
-        "status": "FINISHED",
-    }
-    response = requests.get(API_FOOTBALL_URL, headers=headers, params=params, timeout=15)
-    response.raise_for_status()
-    data = response.json()
-
-    results = []
-    for match in data.get("matches", []):
-        score = match.get("score", {}).get("fullTime", {})
-        if score.get("home") is None or score.get("away") is None:
-            continue
-        results.append({
-            "home": match["homeTeam"]["name"],
-            "away": match["awayTeam"]["name"],
-            "home_goals": score["home"],
-            "away_goals": score["away"],
-        })
-    return results
-
-
 def compute_team_stats(results):
-    """Each team's average goals scored and conceded across the
-    historical results — a simple stand-in for 'team strength'."""
+    """Each team's average goals scored/conceded across historical
+    results. Keyed by (team name, league) since the same club name
+    essentially never repeats across these leagues, but this keeps
+    it correct in principle."""
     raw = {}
     for r in results:
-        raw.setdefault(r["home"], {"scored": [], "conceded": []})
-        raw.setdefault(r["away"], {"scored": [], "conceded": []})
-        raw[r["home"]]["scored"].append(r["home_goals"])
-        raw[r["home"]]["conceded"].append(r["away_goals"])
-        raw[r["away"]]["scored"].append(r["away_goals"])
-        raw[r["away"]]["conceded"].append(r["home_goals"])
+        home_key = (r["home"], r["league"])
+        away_key = (r["away"], r["league"])
+        raw.setdefault(home_key, {"scored": [], "conceded": []})
+        raw.setdefault(away_key, {"scored": [], "conceded": []})
+        raw[home_key]["scored"].append(r["home_goals"])
+        raw[home_key]["conceded"].append(r["away_goals"])
+        raw[away_key]["scored"].append(r["away_goals"])
+        raw[away_key]["conceded"].append(r["home_goals"])
 
     return {
-        team: {
+        key: {
             "avg_scored": sum(s["scored"]) / len(s["scored"]),
             "avg_conceded": sum(s["conceded"]) / len(s["conceded"]),
         }
-        for team, s in raw.items()
+        for key, s in raw.items()
     }
 
 
 def build_training_data(results, team_stats):
-    """Turns historical results into (features, outcome) pairs for training."""
     X, y = [], []
     for r in results:
-        home_stats = team_stats.get(r["home"])
-        away_stats = team_stats.get(r["away"])
+        home_stats = team_stats.get((r["home"], r["league"]))
+        away_stats = team_stats.get((r["away"], r["league"]))
         if not home_stats or not away_stats:
             continue
         X.append([
@@ -291,15 +303,14 @@ def build_training_data(results, team_stats):
 
 def train_model(X, y):
     """
-    Trains a simple logistic regression classifier on team scoring
-    averages. Retrained fresh on every pipeline run — the dataset
-    is small enough (one season) that this is fast and always
-    reflects the latest results, no model file to manage.
+    Trains one combined logistic regression across all leagues —
+    features are team-specific scoring averages, not raw league
+    scorelines, so a single model generalizes reasonably across
+    leagues. Retrained fresh every pipeline run.
     """
     from sklearn.linear_model import LogisticRegression
 
     if len(X) < 20 or len(set(y)) < 2:
-        # Not enough historical data yet to train meaningfully.
         return None
 
     model = LogisticRegression(max_iter=1000)
@@ -307,19 +318,12 @@ def train_model(X, y):
     return model
 
 
-def predict_match(model, team_stats, home_team, away_team):
-    """
-    Predicts one fixture's outcome using the trained model and the
-    two teams' current scoring averages. Falls back to a neutral
-    50/33/17-ish guess if we don't have enough data for one of the
-    teams or the model itself (e.g. newly promoted side, or too
-    early in a season).
-    """
-    home_stats = team_stats.get(home_team)
-    away_stats = team_stats.get(away_team)
+def predict_match(model, team_stats, league, home_team, away_team):
+    home_stats = team_stats.get((home_team, league))
+    away_stats = team_stats.get((away_team, league))
 
     if not model or not home_stats or not away_stats:
-        return "home_win", 40.0  # conservative fallback, not a real prediction
+        return "home_win", 40.0
 
     features = [[
         home_stats["avg_scored"], home_stats["avg_conceded"],
@@ -333,16 +337,11 @@ def predict_match(model, team_stats, home_team, away_team):
     return outcome, confidence
 
 
-def predict_extra_markets(team_stats, home_team, away_team):
-    """
-    Estimates BTTS and Over/Under 2.5 goals using a Poisson goal
-    model built from the same team scoring averages as the main
-    result prediction — no extra API calls needed.
-    """
+def predict_extra_markets(team_stats, league, home_team, away_team):
     from scipy.stats import poisson
 
-    home_stats = team_stats.get(home_team)
-    away_stats = team_stats.get(away_team)
+    home_stats = team_stats.get((home_team, league))
+    away_stats = team_stats.get((away_team, league))
     if not home_stats or not away_stats:
         return []
 
@@ -353,7 +352,6 @@ def predict_extra_markets(team_stats, home_team, away_team):
     p_home_scores = 1 - poisson.pmf(0, lambda_home)
     p_away_scores = 1 - poisson.pmf(0, lambda_away)
     p_btts = float(p_home_scores * p_away_scores)
-
     p_over_2_5 = float(1 - poisson.cdf(2, lambda_total))
 
     predictions = []
@@ -375,7 +373,7 @@ def save_predictions(fixture_ids, model, team_stats):
         for fid in fixture_ids:
             row = conn.execute(
                 text("""
-                    SELECT ht.name AS home, at.name AS away
+                    SELECT f.league, ht.name AS home, at.name AS away
                     FROM fixtures f
                     JOIN teams ht ON ht.id = f.home_team_id
                     JOIN teams at ON at.id = f.away_team_id
@@ -386,9 +384,9 @@ def save_predictions(fixture_ids, model, team_stats):
             if not row:
                 continue
 
-            outcome, confidence = predict_match(model, team_stats, row.home, row.away)
+            outcome, confidence = predict_match(model, team_stats, row.league, row.home, row.away)
             all_predictions = [("match_result", outcome, confidence)]
-            all_predictions += predict_extra_markets(team_stats, row.home, row.away)
+            all_predictions += predict_extra_markets(team_stats, row.league, row.home, row.away)
 
             for market, prediction, conf in all_predictions:
                 existing = conn.execute(
@@ -407,15 +405,24 @@ def save_predictions(fixture_ids, model, team_stats):
 
 
 def run():
-    print("SportIQ AI pipeline: fetching fixtures...")
-    fixtures = fetch_fixtures()
-    fixture_ids = save_fixtures(fixtures)
-    print(f"Saved {len(fixture_ids)} fixtures.")
+    all_fixture_ids = []
+    all_historical = []
 
-    print("Fetching historical results to train the prediction model...")
-    historical = fetch_historical_results()
-    team_stats = compute_team_stats(historical)
-    X, y = build_training_data(historical, team_stats)
+    print("Fetching fixtures and historical results for all leagues...")
+    for i, league in enumerate(LEAGUES):
+        fixtures = fetch_fixtures(league)
+        all_fixture_ids += save_fixtures(fixtures)
+        time.sleep(FOOTBALL_DATA_PACING_SECONDS)
+
+        historical = fetch_historical_results(league)
+        all_historical += historical
+        time.sleep(FOOTBALL_DATA_PACING_SECONDS)
+
+    print(f"Saved {len(all_fixture_ids)} fixtures across {len(LEAGUES)} leagues.")
+
+    print("Training prediction model on all historical results...")
+    team_stats = compute_team_stats(all_historical)
+    X, y = build_training_data(all_historical, team_stats)
     model = train_model(X, y)
     if model:
         print(f"Trained model on {len(X)} historical matches.")
@@ -423,17 +430,16 @@ def run():
         print("Not enough historical data to train a model yet — using fallback predictions.")
 
     print("Generating predictions...")
-    save_predictions(fixture_ids, model, team_stats)
+    save_predictions(all_fixture_ids, model, team_stats)
 
-    print("Fetching odds...")
-    try:
-        events = fetch_odds()
-        saved = save_odds(events)
-        print(f"Saved odds for {saved} fixtures")
-    except Exception as exc:
-        # Odds are a nice-to-have on top of fixtures — don't let a
-        # failed odds fetch take down the whole pipeline run.
-        print(f"Odds fetch failed (continuing without odds): {exc}")
+    print("Fetching odds for all leagues...")
+    for league in LEAGUES:
+        try:
+            events = fetch_odds(league)
+            saved = save_odds(events, league["name"])
+            print(f"  {league['name']}: saved odds for {saved} fixtures")
+        except Exception as exc:
+            print(f"  {league['name']}: odds fetch failed (continuing): {exc}")
 
     print("Done.")
 
